@@ -72,60 +72,47 @@ var TextMessageFormat;
 })(TextMessageFormat = exports.TextMessageFormat || (exports.TextMessageFormat = {}));
 var BinaryMessageFormat;
 (function (BinaryMessageFormat) {
-    // The length prefix of binary messages is encoded as VarInt. Read the comment in
-    // the BinaryMessageParser.TryParseMessage for details.
     function write(output) {
-        // msgpack5 uses returns Buffer instead of Uint8Array on IE10 and some other browser
-        //  in which case .byteLength does will be undefined
+        // .byteLength does is undefined in IE10
         let size = output.byteLength || output.length;
-        let lenBuffer = [];
-        do {
-            let sizePart = size & 0x7f;
-            size = size >> 7;
-            if (size > 0) {
-                sizePart |= 0x80;
-            }
-            lenBuffer.push(sizePart);
-        } while (size > 0);
-        // msgpack5 uses returns Buffer instead of Uint8Array on IE10 and some other browser
-        //  in which case .byteLength does will be undefined
-        size = output.byteLength || output.length;
-        let buffer = new Uint8Array(lenBuffer.length + size);
-        buffer.set(lenBuffer, 0);
-        buffer.set(output, lenBuffer.length);
+        let buffer = new Uint8Array(size + 8);
+        // javascript bitwise operators only support 32-bit integers
+        for (let i = 7; i >= 4; i--) {
+            buffer[i] = size & 0xff;
+            size = size >> 8;
+        }
+        buffer.set(output, 8);
         return buffer.buffer;
     }
     BinaryMessageFormat.write = write;
     function parse(input) {
         let result = [];
         let uint8Array = new Uint8Array(input);
-        const maxLengthPrefixSize = 5;
-        const numBitsToShift = [0, 7, 14, 21, 28];
+        // 8 - the length prefix size
         for (let offset = 0; offset < input.byteLength;) {
-            let numBytes = 0;
+            if (input.byteLength < offset + 8) {
+                throw new Error("Cannot read message size");
+            }
+            // Note javascript bitwise operators only support 32-bit integers - for now cutting bigger messages.
+            // Tracking bug https://github.com/aspnet/SignalR/issues/613
+            if (!(uint8Array[offset] == 0 && uint8Array[offset + 1] == 0 && uint8Array[offset + 2] == 0
+                && uint8Array[offset + 3] == 0 && (uint8Array[offset + 4] & 0x80) == 0)) {
+                throw new Error("Messages bigger than 2147483647 bytes are not supported");
+            }
             let size = 0;
-            let byteRead;
-            do {
-                byteRead = uint8Array[offset + numBytes];
-                size = size | ((byteRead & 0x7f) << (numBitsToShift[numBytes]));
-                numBytes++;
-            } while (numBytes < Math.min(maxLengthPrefixSize, input.byteLength - offset) && (byteRead & 0x80) != 0);
-            if ((byteRead & 0x80) !== 0 && numBytes < maxLengthPrefixSize) {
-                throw new Error("Cannot read message size.");
+            for (let i = 4; i < 8; i++) {
+                size = (size << 8) | uint8Array[offset + i];
             }
-            if (numBytes === maxLengthPrefixSize && byteRead > 7) {
-                throw new Error("Messages bigger than 2GB are not supported.");
-            }
-            if (uint8Array.byteLength >= (offset + numBytes + size)) {
+            if (uint8Array.byteLength >= (offset + 8 + size)) {
                 // IE does not support .slice() so use subarray
                 result.push(uint8Array.slice
-                    ? uint8Array.slice(offset + numBytes, offset + numBytes + size)
-                    : uint8Array.subarray(offset + numBytes, offset + numBytes + size));
+                    ? uint8Array.slice(offset + 8, offset + 8 + size)
+                    : uint8Array.subarray(offset + 8, offset + 8 + size));
             }
             else {
-                throw new Error("Incomplete message.");
+                throw new Error("Incomplete message");
             }
-            offset = offset + numBytes + size;
+            offset = offset + 8 + size;
         }
         return result;
     }
@@ -222,8 +209,8 @@ class HttpConnection {
                 }
                 this.url += (this.url.indexOf("?") == -1 ? "?" : "&") + `id=${this.connectionId}`;
                 this.transport = this.createTransport(this.options.transport, negotiateResponse.availableTransports);
-                this.transport.onreceive = this.onreceive;
-                this.transport.onclose = e => this.stopConnection(true, e);
+                this.transport.onDataReceived = this.onDataReceived;
+                this.transport.onClosed = e => this.stopConnection(true, e);
                 let requestedTransferMode = this.features.transferMode === 2 /* Binary */
                     ? 2 /* Binary */
                     : 1 /* Text */;
@@ -294,8 +281,8 @@ class HttpConnection {
             this.transport = null;
         }
         this.connectionState = 3 /* Disconnected */;
-        if (raiseClosed && this.onclose) {
-            this.onclose(error);
+        if (raiseClosed && this.onClosed) {
+            this.onClosed(error);
         }
     }
     resolveUrl(url) {
@@ -303,7 +290,7 @@ class HttpConnection {
         if (url.lastIndexOf("https://", 0) === 0 || url.lastIndexOf("http://", 0) === 0) {
             return url;
         }
-        if (typeof window === 'undefined' || !window || !window.document) {
+        if (typeof window === 'undefined') {
             throw new Error(`Cannot resolve '${url}'.`);
         }
         let parser = window.document.createElement("a");
@@ -311,9 +298,6 @@ class HttpConnection {
         let baseUrl = (!parser.protocol || parser.protocol === ":")
             ? `${window.document.location.protocol}//${(parser.host || window.document.location.host)}`
             : `${parser.protocol}//${parser.host}`;
-        if (!url || url[0] != '/') {
-            url = '/' + url;
-        }
         let normalizedUrl = baseUrl + url;
         this.logger.log(ILogger_1.LogLevel.Information, `Normalizing '${url}' to '${normalizedUrl}'`);
         return normalizedUrl;
@@ -376,14 +360,17 @@ class HubConnection {
         }
         this.logger = Loggers_1.LoggerFactory.createLogger(options.logging);
         this.protocol = options.protocol || new JsonHubProtocol_1.JsonHubProtocol();
-        this.connection.onreceive = (data) => this.processIncomingData(data);
-        this.connection.onclose = (error) => this.connectionClosed(error);
+        this.connection.onDataReceived = data => {
+            this.onDataReceived(data);
+        };
+        this.connection.onClosed = (error) => {
+            this.onConnectionClosed(error);
+        };
         this.callbacks = new Map();
         this.methods = new Map();
-        this.closedCallbacks = [];
         this.id = 0;
     }
-    processIncomingData(data) {
+    onDataReceived(data) {
         // Parse the messages
         let messages = this.protocol.parseMessages(data);
         for (var i = 0; i < messages.length; ++i) {
@@ -409,9 +396,9 @@ class HubConnection {
         }
     }
     invokeClientMethod(invocationMessage) {
-        let methods = this.methods.get(invocationMessage.target.toLowerCase());
-        if (methods) {
-            methods.forEach(m => m.apply(this, invocationMessage.arguments));
+        let method = this.methods.get(invocationMessage.target.toLowerCase());
+        if (method) {
+            method.apply(this, invocationMessage.arguments);
             if (!invocationMessage.nonblocking) {
                 // TODO: send result back to the server?
             }
@@ -420,7 +407,7 @@ class HubConnection {
             this.logger.log(ILogger_1.LogLevel.Warning, `No client method with the name '${invocationMessage.target}' found.`);
         }
     }
-    connectionClosed(error) {
+    onConnectionClosed(error) {
         let errorCompletionMessage = {
             type: 3 /* Completion */,
             invocationId: "-1",
@@ -430,7 +417,9 @@ class HubConnection {
             callback(errorCompletionMessage);
         });
         this.callbacks.clear();
-        this.closedCallbacks.forEach(c => c.apply(this, [error]));
+        if (this.connectionClosedCallback) {
+            this.connectionClosedCallback(error);
+        }
     }
     start() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -511,33 +500,10 @@ class HubConnection {
         return p;
     }
     on(methodName, method) {
-        if (!methodName || !method) {
-            return;
-        }
-        methodName = methodName.toLowerCase();
-        if (!this.methods.has(methodName)) {
-            this.methods.set(methodName, []);
-        }
-        this.methods.get(methodName).push(method);
+        this.methods.set(methodName.toLowerCase(), method);
     }
-    off(methodName, method) {
-        if (!methodName || !method) {
-            return;
-        }
-        methodName = methodName.toLowerCase();
-        let handlers = this.methods.get(methodName);
-        if (!handlers) {
-            return;
-        }
-        var removeIdx = handlers.indexOf(method);
-        if (removeIdx != -1) {
-            handlers.splice(removeIdx, 1);
-        }
-    }
-    onclose(callback) {
-        if (callback) {
-            this.closedCallbacks.push(callback);
-        }
+    set onClosed(callback) {
+        this.connectionClosedCallback = callback;
     }
     createInvocation(methodName, args, nonblocking) {
         let id = this.id;
@@ -707,18 +673,18 @@ class WebSocketTransport {
             };
             webSocket.onmessage = (message) => {
                 this.logger.log(ILogger_1.LogLevel.Trace, `(WebSockets transport) data received: ${message.data}`);
-                if (this.onreceive) {
-                    this.onreceive(message.data);
+                if (this.onDataReceived) {
+                    this.onDataReceived(message.data);
                 }
             };
             webSocket.onclose = (event) => {
                 // webSocket will be null if the transport did not start successfully
-                if (this.onclose && this.webSocket) {
+                if (this.onClosed && this.webSocket) {
                     if (event.wasClean === false || event.code !== 1000) {
-                        this.onclose(new Error(`Websocket closed with status code: ${event.code} (${event.reason})`));
+                        this.onClosed(new Error(`Websocket closed with status code: ${event.code} (${event.reason})`));
                     }
                     else {
-                        this.onclose();
+                        this.onClosed();
                     }
                 }
             };
@@ -753,14 +719,14 @@ class ServerSentEventsTransport {
             let eventSource = new EventSource(this.url);
             try {
                 eventSource.onmessage = (e) => {
-                    if (this.onreceive) {
+                    if (this.onDataReceived) {
                         try {
                             this.logger.log(ILogger_1.LogLevel.Trace, `(SSE transport) data received: ${e.data}`);
-                            this.onreceive(e.data);
+                            this.onDataReceived(e.data);
                         }
                         catch (error) {
-                            if (this.onclose) {
-                                this.onclose(error);
+                            if (this.onClosed) {
+                                this.onClosed(error);
                             }
                             return;
                         }
@@ -769,8 +735,8 @@ class ServerSentEventsTransport {
                 eventSource.onerror = (e) => {
                     reject();
                     // don't report an error if the transport did not start successfully
-                    if (this.eventSource && this.onclose) {
-                        this.onclose(new Error(e.message || "Error occurred"));
+                    if (this.eventSource && this.onClosed) {
+                        this.onClosed(new Error(e.message || "Error occurred"));
                     }
                 };
                 eventSource.onopen = () => {
@@ -820,22 +786,22 @@ class LongPollingTransport {
         let pollXhr = new XMLHttpRequest();
         pollXhr.onload = () => {
             if (pollXhr.status == 200) {
-                if (this.onreceive) {
+                if (this.onDataReceived) {
                     try {
                         let response = transferMode === 1 /* Text */
                             ? pollXhr.responseText
                             : pollXhr.response;
                         if (response) {
                             this.logger.log(ILogger_1.LogLevel.Trace, `(LongPolling transport) data received: ${response}`);
-                            this.onreceive(response);
+                            this.onDataReceived(response);
                         }
                         else {
                             this.logger.log(ILogger_1.LogLevel.Information, "(LongPolling transport) timed out");
                         }
                     }
                     catch (error) {
-                        if (this.onclose) {
-                            this.onclose(error);
+                        if (this.onClosed) {
+                            this.onClosed(error);
                         }
                         return;
                     }
@@ -843,20 +809,20 @@ class LongPollingTransport {
                 this.poll(url, transferMode);
             }
             else if (this.pollXhr.status == 204) {
-                if (this.onclose) {
-                    this.onclose();
+                if (this.onClosed) {
+                    this.onClosed();
                 }
             }
             else {
-                if (this.onclose) {
-                    this.onclose(new HttpError_1.HttpError(pollXhr.statusText, pollXhr.status));
+                if (this.onClosed) {
+                    this.onClosed(new HttpError_1.HttpError(pollXhr.statusText, pollXhr.status));
                 }
             }
         };
         pollXhr.onerror = () => {
-            if (this.onclose) {
+            if (this.onClosed) {
                 // network related error or denied cross domain request
-                this.onclose(new Error("Sending HTTP request failed."));
+                this.onClosed(new Error("Sending HTTP request failed."));
             }
         };
         pollXhr.ontimeout = () => {

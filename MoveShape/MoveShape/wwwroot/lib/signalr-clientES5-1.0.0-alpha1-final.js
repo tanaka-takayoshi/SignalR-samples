@@ -95,57 +95,43 @@ var TextMessageFormat;
 })(TextMessageFormat = exports.TextMessageFormat || (exports.TextMessageFormat = {}));
 var BinaryMessageFormat;
 (function (BinaryMessageFormat) {
-    // The length prefix of binary messages is encoded as VarInt. Read the comment in
-    // the BinaryMessageParser.TryParseMessage for details.
     function write(output) {
-        // msgpack5 uses returns Buffer instead of Uint8Array on IE10 and some other browser
-        //  in which case .byteLength does will be undefined
+        // .byteLength does is undefined in IE10
         var size = output.byteLength || output.length;
-        var lenBuffer = [];
-        do {
-            var sizePart = size & 0x7f;
-            size = size >> 7;
-            if (size > 0) {
-                sizePart |= 0x80;
-            }
-            lenBuffer.push(sizePart);
-        } while (size > 0);
-        // msgpack5 uses returns Buffer instead of Uint8Array on IE10 and some other browser
-        //  in which case .byteLength does will be undefined
-        size = output.byteLength || output.length;
-        var buffer = new Uint8Array(lenBuffer.length + size);
-        buffer.set(lenBuffer, 0);
-        buffer.set(output, lenBuffer.length);
+        var buffer = new Uint8Array(size + 8);
+        // javascript bitwise operators only support 32-bit integers
+        for (var i = 7; i >= 4; i--) {
+            buffer[i] = size & 0xff;
+            size = size >> 8;
+        }
+        buffer.set(output, 8);
         return buffer.buffer;
     }
     BinaryMessageFormat.write = write;
     function parse(input) {
         var result = [];
         var uint8Array = new Uint8Array(input);
-        var maxLengthPrefixSize = 5;
-        var numBitsToShift = [0, 7, 14, 21, 28];
+        // 8 - the length prefix size
         for (var offset = 0; offset < input.byteLength;) {
-            var numBytes = 0;
+            if (input.byteLength < offset + 8) {
+                throw new Error("Cannot read message size");
+            }
+            // Note javascript bitwise operators only support 32-bit integers - for now cutting bigger messages.
+            // Tracking bug https://github.com/aspnet/SignalR/issues/613
+            if (!(uint8Array[offset] == 0 && uint8Array[offset + 1] == 0 && uint8Array[offset + 2] == 0 && uint8Array[offset + 3] == 0 && (uint8Array[offset + 4] & 0x80) == 0)) {
+                throw new Error("Messages bigger than 2147483647 bytes are not supported");
+            }
             var size = 0;
-            var byteRead = void 0;
-            do {
-                byteRead = uint8Array[offset + numBytes];
-                size = size | (byteRead & 0x7f) << numBitsToShift[numBytes];
-                numBytes++;
-            } while (numBytes < Math.min(maxLengthPrefixSize, input.byteLength - offset) && (byteRead & 0x80) != 0);
-            if ((byteRead & 0x80) !== 0 && numBytes < maxLengthPrefixSize) {
-                throw new Error("Cannot read message size.");
+            for (var i = 4; i < 8; i++) {
+                size = size << 8 | uint8Array[offset + i];
             }
-            if (numBytes === maxLengthPrefixSize && byteRead > 7) {
-                throw new Error("Messages bigger than 2GB are not supported.");
-            }
-            if (uint8Array.byteLength >= offset + numBytes + size) {
+            if (uint8Array.byteLength >= offset + 8 + size) {
                 // IE does not support .slice() so use subarray
-                result.push(uint8Array.slice ? uint8Array.slice(offset + numBytes, offset + numBytes + size) : uint8Array.subarray(offset + numBytes, offset + numBytes + size));
+                result.push(uint8Array.slice ? uint8Array.slice(offset + 8, offset + 8 + size) : uint8Array.subarray(offset + 8, offset + 8 + size));
             } else {
-                throw new Error("Incomplete message.");
+                throw new Error("Incomplete message");
             }
-            offset = offset + numBytes + size;
+            offset = offset + 8 + size;
         }
         return result;
     }
@@ -356,8 +342,8 @@ var HttpConnection = function () {
                             case 8:
                                 this.url += (this.url.indexOf("?") == -1 ? "?" : "&") + ("id=" + this.connectionId);
                                 this.transport = this.createTransport(this.options.transport, negotiateResponse.availableTransports);
-                                this.transport.onreceive = this.onreceive;
-                                this.transport.onclose = function (e) {
+                                this.transport.onDataReceived = this.onDataReceived;
+                                this.transport.onClosed = function (e) {
                                     return _this.stopConnection(true, e);
                                 };
                                 requestedTransferMode = this.features.transferMode === 2 /* Binary */
@@ -480,8 +466,8 @@ var HttpConnection = function () {
                 this.transport = null;
             }
             this.connectionState = 3 /* Disconnected */;
-            if (raiseClosed && this.onclose) {
-                this.onclose(error);
+            if (raiseClosed && this.onClosed) {
+                this.onClosed(error);
             }
         }
     }, {
@@ -491,15 +477,12 @@ var HttpConnection = function () {
             if (url.lastIndexOf("https://", 0) === 0 || url.lastIndexOf("http://", 0) === 0) {
                 return url;
             }
-            if (typeof window === 'undefined' || !window || !window.document) {
+            if (typeof window === 'undefined') {
                 throw new Error("Cannot resolve '" + url + "'.");
             }
             var parser = window.document.createElement("a");
             parser.href = url;
             var baseUrl = !parser.protocol || parser.protocol === ":" ? window.document.location.protocol + "//" + (parser.host || window.document.location.host) : parser.protocol + "//" + parser.host;
-            if (!url || url[0] != '/') {
-                url = '/' + url;
-            }
             var normalizedUrl = baseUrl + url;
             this.logger.log(ILogger_1.LogLevel.Information, "Normalizing '" + url + "' to '" + normalizedUrl + "'");
             return normalizedUrl;
@@ -642,21 +625,20 @@ var HubConnection = function () {
         }
         this.logger = Loggers_1.LoggerFactory.createLogger(options.logging);
         this.protocol = options.protocol || new JsonHubProtocol_1.JsonHubProtocol();
-        this.connection.onreceive = function (data) {
-            return _this.processIncomingData(data);
+        this.connection.onDataReceived = function (data) {
+            _this.onDataReceived(data);
         };
-        this.connection.onclose = function (error) {
-            return _this.connectionClosed(error);
+        this.connection.onClosed = function (error) {
+            _this.onConnectionClosed(error);
         };
         this.callbacks = new _map2.default();
         this.methods = new _map2.default();
-        this.closedCallbacks = [];
         this.id = 0;
     }
 
     (0, _createClass3.default)(HubConnection, [{
-        key: "processIncomingData",
-        value: function processIncomingData(data) {
+        key: "onDataReceived",
+        value: function onDataReceived(data) {
             // Parse the messages
             var messages = this.protocol.parseMessages(data);
             for (var i = 0; i < messages.length; ++i) {
@@ -684,13 +666,9 @@ var HubConnection = function () {
     }, {
         key: "invokeClientMethod",
         value: function invokeClientMethod(invocationMessage) {
-            var _this2 = this;
-
-            var methods = this.methods.get(invocationMessage.target.toLowerCase());
-            if (methods) {
-                methods.forEach(function (m) {
-                    return m.apply(_this2, invocationMessage.arguments);
-                });
+            var method = this.methods.get(invocationMessage.target.toLowerCase());
+            if (method) {
+                method.apply(this, invocationMessage.arguments);
                 if (!invocationMessage.nonblocking) {
                     // TODO: send result back to the server?
                 }
@@ -699,10 +677,8 @@ var HubConnection = function () {
             }
         }
     }, {
-        key: "connectionClosed",
-        value: function connectionClosed(error) {
-            var _this3 = this;
-
+        key: "onConnectionClosed",
+        value: function onConnectionClosed(error) {
             var errorCompletionMessage = {
                 type: 3 /* Completion */
                 , invocationId: "-1",
@@ -712,9 +688,9 @@ var HubConnection = function () {
                 callback(errorCompletionMessage);
             });
             this.callbacks.clear();
-            this.closedCallbacks.forEach(function (c) {
-                return c.apply(_this3, [error]);
-            });
+            if (this.connectionClosedCallback) {
+                this.connectionClosedCallback(error);
+            }
         }
     }, {
         key: "start",
@@ -759,7 +735,7 @@ var HubConnection = function () {
     }, {
         key: "stream",
         value: function stream(methodName) {
-            var _this4 = this;
+            var _this2 = this;
 
             for (var _len = arguments.length, args = Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
                 args[_key - 1] = arguments[_key];
@@ -785,7 +761,7 @@ var HubConnection = function () {
             var message = this.protocol.writeMessage(invocationDescriptor);
             this.connection.send(message).catch(function (e) {
                 subject.error(e);
-                _this4.callbacks.delete(invocationDescriptor.invocationId);
+                _this2.callbacks.delete(invocationDescriptor.invocationId);
             });
             return subject;
         }
@@ -803,7 +779,7 @@ var HubConnection = function () {
     }, {
         key: "invoke",
         value: function invoke(methodName) {
-            var _this5 = this;
+            var _this3 = this;
 
             for (var _len3 = arguments.length, args = Array(_len3 > 1 ? _len3 - 1 : 0), _key3 = 1; _key3 < _len3; _key3++) {
                 args[_key3 - 1] = arguments[_key3];
@@ -811,7 +787,7 @@ var HubConnection = function () {
 
             var invocationDescriptor = this.createInvocation(methodName, args, false);
             var p = new _promise2.default(function (resolve, reject) {
-                _this5.callbacks.set(invocationDescriptor.invocationId, function (invocationEvent) {
+                _this3.callbacks.set(invocationDescriptor.invocationId, function (invocationEvent) {
                     if (invocationEvent.type === 3 /* Completion */) {
                             var completionMessage = invocationEvent;
                             if (completionMessage.error) {
@@ -823,10 +799,10 @@ var HubConnection = function () {
                         reject(new Error("Streaming methods must be invoked using HubConnection.stream"));
                     }
                 });
-                var message = _this5.protocol.writeMessage(invocationDescriptor);
-                _this5.connection.send(message).catch(function (e) {
+                var message = _this3.protocol.writeMessage(invocationDescriptor);
+                _this3.connection.send(message).catch(function (e) {
                     reject(e);
-                    _this5.callbacks.delete(invocationDescriptor.invocationId);
+                    _this3.callbacks.delete(invocationDescriptor.invocationId);
                 });
             });
             return p;
@@ -834,37 +810,7 @@ var HubConnection = function () {
     }, {
         key: "on",
         value: function on(methodName, method) {
-            if (!methodName || !method) {
-                return;
-            }
-            methodName = methodName.toLowerCase();
-            if (!this.methods.has(methodName)) {
-                this.methods.set(methodName, []);
-            }
-            this.methods.get(methodName).push(method);
-        }
-    }, {
-        key: "off",
-        value: function off(methodName, method) {
-            if (!methodName || !method) {
-                return;
-            }
-            methodName = methodName.toLowerCase();
-            var handlers = this.methods.get(methodName);
-            if (!handlers) {
-                return;
-            }
-            var removeIdx = handlers.indexOf(method);
-            if (removeIdx != -1) {
-                handlers.splice(removeIdx, 1);
-            }
-        }
-    }, {
-        key: "onclose",
-        value: function onclose(callback) {
-            if (callback) {
-                this.closedCallbacks.push(callback);
-            }
+            this.methods.set(methodName.toLowerCase(), method);
         }
     }, {
         key: "createInvocation",
@@ -878,6 +824,11 @@ var HubConnection = function () {
                 arguments: args,
                 nonblocking: nonblocking
             };
+        }
+    }, {
+        key: "onClosed",
+        set: function set(callback) {
+            this.connectionClosedCallback = callback;
         }
     }]);
     return HubConnection;
@@ -1235,17 +1186,17 @@ var WebSocketTransport = function () {
                 };
                 webSocket.onmessage = function (message) {
                     _this.logger.log(ILogger_1.LogLevel.Trace, "(WebSockets transport) data received: " + message.data);
-                    if (_this.onreceive) {
-                        _this.onreceive(message.data);
+                    if (_this.onDataReceived) {
+                        _this.onDataReceived(message.data);
                     }
                 };
                 webSocket.onclose = function (event) {
                     // webSocket will be null if the transport did not start successfully
-                    if (_this.onclose && _this.webSocket) {
+                    if (_this.onClosed && _this.webSocket) {
                         if (event.wasClean === false || event.code !== 1000) {
-                            _this.onclose(new Error("Websocket closed with status code: " + event.code + " (" + event.reason + ")"));
+                            _this.onClosed(new Error("Websocket closed with status code: " + event.code + " (" + event.reason + ")"));
                         } else {
-                            _this.onclose();
+                            _this.onClosed();
                         }
                     }
                 };
@@ -1295,13 +1246,13 @@ var ServerSentEventsTransport = function () {
                 var eventSource = new EventSource(_this2.url);
                 try {
                     eventSource.onmessage = function (e) {
-                        if (_this2.onreceive) {
+                        if (_this2.onDataReceived) {
                             try {
                                 _this2.logger.log(ILogger_1.LogLevel.Trace, "(SSE transport) data received: " + e.data);
-                                _this2.onreceive(e.data);
+                                _this2.onDataReceived(e.data);
                             } catch (error) {
-                                if (_this2.onclose) {
-                                    _this2.onclose(error);
+                                if (_this2.onClosed) {
+                                    _this2.onClosed(error);
                                 }
                                 return;
                             }
@@ -1310,8 +1261,8 @@ var ServerSentEventsTransport = function () {
                     eventSource.onerror = function (e) {
                         reject();
                         // don't report an error if the transport did not start successfully
-                        if (_this2.eventSource && _this2.onclose) {
-                            _this2.onclose(new Error(e.message || "Error occurred"));
+                        if (_this2.eventSource && _this2.onClosed) {
+                            _this2.onClosed(new Error(e.message || "Error occurred"));
                         }
                     };
                     eventSource.onopen = function () {
@@ -1388,38 +1339,38 @@ var LongPollingTransport = function () {
             var pollXhr = new XMLHttpRequest();
             pollXhr.onload = function () {
                 if (pollXhr.status == 200) {
-                    if (_this3.onreceive) {
+                    if (_this3.onDataReceived) {
                         try {
                             var response = transferMode === 1 /* Text */
                             ? pollXhr.responseText : pollXhr.response;
                             if (response) {
                                 _this3.logger.log(ILogger_1.LogLevel.Trace, "(LongPolling transport) data received: " + response);
-                                _this3.onreceive(response);
+                                _this3.onDataReceived(response);
                             } else {
                                 _this3.logger.log(ILogger_1.LogLevel.Information, "(LongPolling transport) timed out");
                             }
                         } catch (error) {
-                            if (_this3.onclose) {
-                                _this3.onclose(error);
+                            if (_this3.onClosed) {
+                                _this3.onClosed(error);
                             }
                             return;
                         }
                     }
                     _this3.poll(url, transferMode);
                 } else if (_this3.pollXhr.status == 204) {
-                    if (_this3.onclose) {
-                        _this3.onclose();
+                    if (_this3.onClosed) {
+                        _this3.onClosed();
                     }
                 } else {
-                    if (_this3.onclose) {
-                        _this3.onclose(new HttpError_1.HttpError(pollXhr.statusText, pollXhr.status));
+                    if (_this3.onClosed) {
+                        _this3.onClosed(new HttpError_1.HttpError(pollXhr.statusText, pollXhr.status));
                     }
                 }
             };
             pollXhr.onerror = function () {
-                if (_this3.onclose) {
+                if (_this3.onClosed) {
                     // network related error or denied cross domain request
-                    _this3.onclose(new Error("Sending HTTP request failed."));
+                    _this3.onClosed(new Error("Sending HTTP request failed."));
                 }
             };
             pollXhr.ontimeout = function () {
